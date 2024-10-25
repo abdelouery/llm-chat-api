@@ -13,31 +13,60 @@ mongoClient = MongoClient('localhost', 27017)
 
 # load history from
 db = mongoClient.llm_chat
-history_collection = db.history
-history = list(history_collection.find())
+current_conversation = db.conversations.find_one()
+history = list(current_conversation['history'])
 
-def send_request():
-    completion = openai_client.chat.completions.create(
+def create_history_entry(conversation_id, entry):
+    db.conversations.update_one(
+        {'title': conversation_id},
+        {'$push': {'history': entry}}
+    )
+
+def send_request(id):
+    stream = openai_client.chat.completions.create(
         model="model-identifier",
         messages=dumps(history),
         temperature=0.7,
+        stream=True
     )
-    response = completion.choices[0].message.content
-    resp = {"role": "assistant", "content": response}
-    history_collection.insert_one(resp)
-    history.append(resp)
-    return dumps(resp)
 
-@app.get('/api/history')
-@cross_origin()
-def get_history():
-    return Response(dumps(history), mimetype='application/json')
+    def generate_stream_response():
+        total_response = ''
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                total_response += chunk.choices[0].delta.content
+                yield chunk.choices[0].delta.content
+        resp = {"role": "assistant", "content": total_response}
+        create_history_entry(id, resp)
+        history.append(resp)
 
-@app.post('/api/prompt')
+    return generate_stream_response()
+
+@app.get('/api/conversations')
 @cross_origin()
-def prompt():
+def get_conversations():
+    conversations = db.conversations.find()
+    return Response(dumps(conversations))
+
+@app.post('/api/conversations')
+@cross_origin()
+def create_conversation():
+    request_body = request.get_json()
+    db.conversations.insert_one(request_body)
+    created_conv = db.conversations.find_one({'title': request_body['title']})
+    return Response(dumps(created_conv))
+
+@app.get('/api/history/<id>')
+@cross_origin()
+def get_history(id):
+    conversation_history = db.conversations.find_one({'title': id })
+    return Response(dumps(conversation_history['history']), mimetype='application/json')
+
+@app.post('/api/prompt/<id>')
+@cross_origin()
+def prompt(id):
     request_body = request.get_json()
     msg = {"role": "user", "content": request_body.get('content') }
-    history_collection.insert_one(msg)
+    create_history_entry(id, msg)
     history.append(msg)
-    return send_request()
+    return send_request(id)
